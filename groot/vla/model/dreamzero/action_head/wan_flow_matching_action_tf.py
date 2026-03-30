@@ -21,20 +21,58 @@ from huggingface_hub import hf_hub_download
 logger = logging.getLogger(__name__)
 
 WAN_HF_REPO_ID = "Wan-AI/Wan2.1-I2V-14B-480P"
-WAN22_HF_REPO_ID = "Wan-AI/Wan2.2-TI2V-5B"
+DEFAULT_LOCAL_WAN_DIR = None
 
 
-def hf_download(filename: str, repo_id: str = WAN_HF_REPO_ID) -> str:
-    """Download a file from the specified HuggingFace repo to HF cache."""
-    path = hf_hub_download(repo_id=repo_id, filename=filename)
+def hf_download(filename: str) -> str:
+    """Download a file from the Wan2.1-I2V-14B-480P HuggingFace repo to HF cache."""
+    path = hf_hub_download(repo_id=WAN_HF_REPO_ID, filename=filename)
     return path
 
 
-def ensure_file(path: str | None, hf_filename: str, repo_id: str = WAN_HF_REPO_ID) -> str:
-    """Return a valid local path: use `path` if it exists, otherwise download from HuggingFace."""
+def get_local_wan_dir() -> str | None:
+    local_wan_dir = os.environ.get("WAN_CKPT_DIR", DEFAULT_LOCAL_WAN_DIR)
+    if local_wan_dir and os.path.isdir(local_wan_dir):
+        return local_wan_dir
+    return None
+
+
+def ensure_file(path: str | None, hf_filename: str) -> str:
+    """Return a valid local path, preferring explicit and local Wan files before HuggingFace."""
     if path is not None and os.path.exists(path):
         return path
-    return hf_download(hf_filename, repo_id)
+    local_wan_dir = get_local_wan_dir()
+    if local_wan_dir is not None:
+        local_candidate = os.path.join(local_wan_dir, hf_filename)
+        if os.path.exists(local_candidate):
+            logger.info("Using local Wan file for %s: %s", hf_filename, local_candidate)
+            return local_candidate
+    return hf_download(hf_filename)
+
+
+def ensure_diffusion_dir(path: str | None) -> str:
+    """Return a valid local diffusion dir, preferring a local Wan directory before HuggingFace."""
+    if path is not None and os.path.isdir(path):
+        return path
+
+    local_wan_dir = get_local_wan_dir()
+    if local_wan_dir is not None:
+        index_path = os.path.join(local_wan_dir, "diffusion_pytorch_model.safetensors.index.json")
+        safetensors_path = os.path.join(local_wan_dir, "diffusion_pytorch_model.safetensors")
+        if os.path.exists(index_path) or os.path.exists(safetensors_path):
+            logger.info("Using local Wan diffusion directory: %s", local_wan_dir)
+            return local_wan_dir
+
+    index_path = hf_hub_download(
+        repo_id=WAN_HF_REPO_ID,
+        filename="diffusion_pytorch_model.safetensors.index.json",
+    )
+    dit_dir = os.path.dirname(index_path)
+    with open(index_path, 'r') as f:
+        index = json.load(f)
+    for shard_file in set(index["weight_map"].values()):
+        hf_hub_download(repo_id=WAN_HF_REPO_ID, filename=shard_file)
+    return dit_dir
 
 from torch.distributions import Beta
 import torch.distributed as dist
@@ -73,10 +111,6 @@ class WANPolicyHeadConfig(PretrainedConfig):
     tile_stride_height: int = field(default=18, metadata={"help": "Tile stride height."})
     tile_stride_width: int = field(default=16, metadata={"help": "Tile stride width."})
     num_frame_per_block: int = field(default=1, metadata={"help": "Number of frames per block."})
-    # Target video (H, W) for Wan22 resize. When set, videos are resized to this before VAE so latent
-    # spatial size matches. Use height/width divisible by 32 for WanVideoVAE38 (16x) so latent H,W are even.
-    target_video_height: int | None = field(default=None, metadata={"help": "Target video height for resize (e.g. 160 for even latent with VAE38)."})
-    target_video_width: int | None = field(default=None, metadata={"help": "Target video width for resize (e.g. 320)."})
 
     lora_rank: int = field(default=4, metadata={"help": "LoRA rank."})
     lora_alpha: int = field(default=4, metadata={"help": "LoRA alpha."})
@@ -251,27 +285,14 @@ class WANPolicyHead(ActionHead):
         )
         self.image_encoder.model.load_state_dict(torch.load(img_enc_path, map_location='cpu'), strict=False)
 
-        # Wan2.2 (WanVideoVAE38, z_dim=48) uses Wan2.2_VAE.pth; Wan2.1 uses Wan2.1_VAE.pth
-        vae_hf_filename = "Wan2.2_VAE.pth" if getattr(self.vae, "z_dim", 16) == 48 else "Wan2.1_VAE.pth"
-        vae_repo_id = WAN22_HF_REPO_ID if getattr(self.vae, "z_dim", 16) == 48 else WAN_HF_REPO_ID
         vae_path = ensure_file(
             self.vae.vae_pretrained_path,
-            vae_hf_filename,
-            repo_id=vae_repo_id,
+            "Wan2.1_VAE.pth",
         )
         self.vae.model.load_state_dict(torch.load(vae_path, map_location='cpu'))
 
         if not config.skip_component_loading:
-            dit_dir = self.model.diffusion_model_pretrained_path
-            # Wan2.2 (in_dim=48) uses Wan2.2-TI2V-5B repo; Wan2.1 uses Wan2.1-I2V-14B-480P
-            dit_repo_id = WAN22_HF_REPO_ID if getattr(self.model, "in_dim", 16) == 48 else WAN_HF_REPO_ID
-            if dit_dir is None or not os.path.isdir(dit_dir):
-                index_path = hf_hub_download(repo_id=dit_repo_id, filename="diffusion_pytorch_model.safetensors.index.json")
-                dit_dir = os.path.dirname(index_path)
-                with open(index_path, 'r') as f:
-                    index = json.load(f)
-                for shard_file in set(index["weight_map"].values()):
-                    hf_hub_download(repo_id=dit_repo_id, filename=shard_file)
+            dit_dir = ensure_diffusion_dir(self.model.diffusion_model_pretrained_path)
 
             if dit_dir is not None:
                 safetensors_path = os.path.join(dit_dir, "diffusion_pytorch_model.safetensors")
@@ -318,6 +339,7 @@ class WANPolicyHead(ActionHead):
         # self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
         self._noise_logged = False
+        self._debug_forward_count = 0  # counts forward() calls for debug throttling
         self.defer_lora_injection = config.defer_lora_injection
         print("defer_lora_injection@@", self.defer_lora_injection)
         self.set_trainable_parameters(config.tune_projector, config.tune_diffusion_model)
@@ -490,18 +512,15 @@ class WANPolicyHead(ActionHead):
     ) -> tuple[KVCacheType, KVCacheType]:
         """
         Initialize a Per-GPU KV cache for the Wan model.
-        Use the model's num_heads and head_dim (5B has 24 heads, 14B has 40).
         """
-        num_heads = self.model.num_heads
-        head_dim = self.model.dim // num_heads
         kv_cache1: KVCacheType = []
         kv_cache_neg: KVCacheType = []
         for _ in range(self.model.num_layers):
             kv_cache1.append(
-                torch.zeros([2, batch_size, 0, num_heads, head_dim], dtype=dtype, device=device),
+               torch.zeros([2, batch_size, 0, 40, 128], dtype=dtype, device=device),
             )
             kv_cache_neg.append(
-                torch.zeros([2, batch_size, 0, num_heads, head_dim], dtype=dtype, device=device),
+                torch.zeros([2, batch_size, 0, 40, 128], dtype=dtype, device=device),
             )
 
         return kv_cache1, kv_cache_neg
@@ -511,19 +530,16 @@ class WANPolicyHead(ActionHead):
     ) -> tuple[KVCacheType, KVCacheType]:
         """
         Initialize a Per-GPU cross-attention cache for the Wan model.
-        Use the model's num_heads and head_dim (5B has 24 heads, 14B has 40).
         """
-        num_heads = self.model.num_heads
-        head_dim = self.model.dim // num_heads
         crossattn_cache: KVCacheType = []
         crossattn_cache_neg: KVCacheType = []
 
         for _ in range(self.model.num_layers):
             crossattn_cache.append(
-                torch.zeros([2, batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
+                torch.zeros([2, batch_size, 512, 40, 128], dtype=dtype, device=device),
             )
             crossattn_cache_neg.append(
-                torch.zeros([2, batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
+                torch.zeros([2, batch_size, 512, 40, 128], dtype=dtype, device=device),
             )
 
         return crossattn_cache, crossattn_cache_neg
@@ -564,19 +580,19 @@ class WANPolicyHead(ActionHead):
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             batch_size = image.shape[0]
             clip_context = self.image_encoder.encode_image(image)
+            msk = torch.ones(batch_size, num_frames, height//8, width//8, device=self._device)
+            msk[:, 1:] = 0
+            msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+            msk = msk.view(batch_size, msk.shape[1] // 4, 4, height//8, width//8)
+            msk = msk.transpose(1, 2)
+            # mask shape is B * 4 * (1+(T-1)/4) * h/8 * w/8
             image_input = image.transpose(1, 2)
             image_zeros = torch.zeros(batch_size, 3, num_frames-1, height, width, dtype=torch.bfloat16, device=self._device)
             self._ensure_vae_on_device(image_input)
             with torch.no_grad():
                 y = self.vae.encode(torch.concat([image_input, image_zeros], dim=2))
-            # Build mask to match VAE output shape (VAE may use different spatial downsampling, e.g. WanVideoVAE38 uses patch_size=2 -> height/16)
-            # y shape is B * 16 * (1+(T-1)/4) * H_latent * W_latent
-            num_t = y.shape[2]
-            h_latent, w_latent = y.shape[3], y.shape[4]
-            msk = torch.zeros(batch_size, 4, num_t, h_latent, w_latent, dtype=y.dtype, device=self._device)
-            msk[:, :, 0:1, :, :] = 1
             new_image = y[:, :, 0:1]
-            # concat: B * (4+16) * (1+(T-1)/4) * H_latent * W_latent
+            # y shape is B * 16 * (1+(T-1)/4) * h/8 * w/8
             y = torch.concat([msk, y], dim=1)
         return clip_context, y, new_image
     
@@ -620,8 +636,14 @@ class WANPolicyHead(ActionHead):
         videos = data["images"]
 
         videos = rearrange(videos, "b t h w c -> b c t h w")
-        print("videos", videos.shape)
-        
+
+        _debug_this_step = self._debug_forward_count < 3  # only print for first 3 forward calls
+        _is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+        if _debug_this_step and _is_rank0:
+            print(f"\n[DEBUG][forward] === Step {self._debug_forward_count} ===")
+            print(f"[DEBUG][forward] videos (b,c,t,h,w)={tuple(videos.shape)}, dtype={videos.dtype}")
+            print(f"[DEBUG][forward] actions shape={tuple(actions.shape)}, state_features shape={tuple(state_features.shape)}")
+            print(f"[DEBUG][forward] embodiment_id={embodiment_id}, has_real_action={has_real_action}")
 
         if videos.dtype == torch.uint8:
             videos = videos.float() / 255.0
@@ -635,34 +657,19 @@ class WANPolicyHead(ActionHead):
         
         # shape of B * max_length * dim
         prompt_embs = self.encode_prompt(data["text"], data["text_attention_mask"])
-
-        # Wan 5B: resize to target resolution so latent tokens/frame matches DiT. Use config target when set
-        # (e.g. 160x320 so latent is 10x20 with VAE38 16x → even H,W, no crop in dynamics loss); else 176x320.
-        target_h = getattr(self.config, "target_video_height", None)
-        target_w = getattr(self.config, "target_video_width", None)
-        if target_h is None or target_w is None:
-            if getattr(self.model, "frame_seqlen", None) in (50, 55):
-                target_h, target_w = 176, 320
-            else:
-                target_h, target_w = None, None
-        if target_h is not None and target_w is not None:
-            _, _, _, h, w = videos.shape
-            if (h, w) != (target_h, target_w):
-                b, c, t, _, _ = videos.shape
-                videos = torch.nn.functional.interpolate(
-                    videos.reshape(b * t, c, h, w),
-                    size=(target_h, target_w),
-                    mode="bilinear",
-                    align_corners=False,
-                ).reshape(b, c, t, target_h, target_w)
+        if _debug_this_step and _is_rank0:
+            print(f"[DEBUG][forward] prompt_embs shape={tuple(prompt_embs.shape)}, dtype={prompt_embs.dtype}")
 
         latents = self.encode_video(videos, self.tiled, (self.tile_size_height, self.tile_size_width), (self.tile_stride_height, self.tile_stride_width))
+        if _debug_this_step and _is_rank0:
+            print(f"[DEBUG][forward] latents (VAE encoded) shape={tuple(latents.shape)}, dtype={latents.dtype}")
 
-        # print("latents shape", latents.shape, self.dtype)
         _, _, num_frames, height, width = videos.shape
         image = videos[:, :, :1].transpose(1, 2)
 
         clip_feas, ys, _ = self.encode_image(image, num_frames, height, width)
+        if _debug_this_step and _is_rank0:
+            print(f"[DEBUG][forward] clip_feas shape={tuple(clip_feas.shape)}, ys shape={tuple(ys.shape)}")
 
         latents = latents.to(self._device)
         clip_feas = clip_feas.to(self._device)
@@ -736,9 +743,9 @@ class WANPolicyHead(ActionHead):
         timestep_id_block = timestep_id_block.reshape(timestep_id_block.shape[0], -1)
         timestep_id = torch.concat([timestep_id[:, :1], timestep_id_block], dim=1)
         _, num_frames, num_channels, height, width = noise.shape
-        # DiT patch_embedding uses stride (1,2,2), so sequence length is num_frames * (H//2) * (W//2)
-        tokens_per_frame = (height // 2) * (width // 2)
-        seq_len = num_frames * tokens_per_frame
+        # Match the DiT's (1, 2, 2) patch embedding tokenization on latent frames.
+        frame_seqlen = (height // 2) * (width // 2)
+        seq_len = num_frames * frame_seqlen
 
         timestep = self.scheduler.timesteps[timestep_id].to(self._device)
         noisy_latents = self.scheduler.add_noise(latents.flatten(0, 1), noise.flatten(0, 1), timestep.flatten(0, 1)).unflatten(0, (noise.shape[0], noise.shape[1]))
@@ -757,30 +764,31 @@ class WANPolicyHead(ActionHead):
             noisy_actions = None
             training_target_action = None
 
+        if _debug_this_step and _is_rank0:
+            print(f"[DEBUG][forward] noisy_latents shape={tuple(noisy_latents.shape)}, noisy_actions shape={tuple(noisy_actions.shape) if noisy_actions is not None else None}")
+            print(f"[DEBUG][forward] timestep shape={tuple(timestep.shape)}, seq_len={seq_len}")
+
         # Compute loss
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             if actions.numel() > 0:
                 video_noise_pred, action_noise_pred = self.model(
                     noisy_latents.transpose(1, 2), timestep=timestep, clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
                     state=state_features, embodiment_id=embodiment_id,
-                    action=noisy_actions, timestep_action=timestep_action, 
+                    action=noisy_actions, timestep_action=timestep_action,
                     clean_x=latents.transpose(1, 2),
                 )
             else:
                 video_noise_pred, action_noise_pred = self.model(
-                    noisy_latents.transpose(1, 2), timestep=timestep, timestep_action=timestep_action, 
+                    noisy_latents.transpose(1, 2), timestep=timestep, timestep_action=timestep_action,
                     clip_feature=clip_feas, y=ys, context=prompt_embs, seq_len=seq_len,
                     state=state_features, embodiment_id=embodiment_id,
                     clean_x=latents.transpose(1, 2),
                 )
 
+            if _debug_this_step and _is_rank0:
+                print(f"[DEBUG][forward] video_noise_pred shape={tuple(video_noise_pred.shape)}, action_noise_pred shape={tuple(action_noise_pred.shape) if action_noise_pred is not None else None}")
+
             # Per-sample dynamics loss
-            # DiT patch_embedding uses stride (1,2,2), so output spatial size can be smaller than
-            # latent when H or W is odd (e.g. latent 11x20 -> model output 10x20). Crop target to match.
-            if training_target.shape != video_noise_pred.shape:
-                training_target = training_target[
-                    ..., : video_noise_pred.shape[3], : video_noise_pred.shape[4]
-                ]
             dynamics_loss_per_sample = torch.nn.functional.mse_loss(
                 video_noise_pred.float(), training_target.float(), reduction='none'
             ).mean(dim=(1,3,4))  # shape: [B, ...]
@@ -792,7 +800,7 @@ class WANPolicyHead(ActionHead):
                 action_loss_per_sample = torch.nn.functional.mse_loss(
                     action_noise_pred.float(), training_target_action.float(), reduction='none'
                 ) * action_mask  # shape: [B, ...]
-                action_loss_per_sample = has_real_action[:, None].float() * action_loss_per_sample  # apply has_real_action
+                action_loss_per_sample = has_real_action[:, None, None].float() * action_loss_per_sample  # apply has_real_action across all action tokens and dims
                 weight_action = action_loss_per_sample.mean(dim=2) * self.scheduler.training_weight(
                     timestep_action.flatten(0, 1),
                 ).unflatten(0, (noise_action.shape[0], noise_action.shape[1])).to(self._device)
@@ -809,6 +817,10 @@ class WANPolicyHead(ActionHead):
             "dynamics_loss": weighted_dynamics_loss,
             "action_loss": weighted_action_loss,
         }
+
+        if _debug_this_step and _is_rank0:
+            print(f"[DEBUG][forward] loss={loss.item():.6f}, dynamics_loss={weighted_dynamics_loss.item():.6f}, action_loss={weighted_action_loss.item():.6f}")
+        self._debug_forward_count += 1
 
         return BatchFeature(data=output_dict)
 
@@ -1009,25 +1021,6 @@ class WANPolicyHead(ActionHead):
         state_features = state_features.to(dtype=torch.bfloat16)
         videos = videos.to(dtype=torch.bfloat16)
 
-        # Wan 5B: same as training — resize to target resolution so latent matches DiT
-        target_h = getattr(self.config, "target_video_height", None)
-        target_w = getattr(self.config, "target_video_width", None)
-        if target_h is None or target_w is None:
-            if getattr(self.model, "frame_seqlen", None) in (50, 55):
-                target_h, target_w = 176, 320
-            else:
-                target_h, target_w = None, None
-        if target_h is not None and target_w is not None:
-            _, _, _, h, w = videos.shape
-            if (h, w) != (target_h, target_w):
-                b, c, t, _, _ = videos.shape
-                videos = torch.nn.functional.interpolate(
-                    videos.reshape(b * t, c, h, w),
-                    size=(target_h, target_w),
-                    mode="bilinear",
-                    align_corners=False,
-                ).reshape(b, c, t, target_h, target_w)
-
         if self.language is None:
             print("language is None, reset current_start_frame to 0")
             self.language = data["text"]
@@ -1101,14 +1094,13 @@ class WANPolicyHead(ActionHead):
 
         end_vae_event.record()
 
-        noise_obs = self.generate_noise((image.shape[0], image.shape[1], self.num_frame_per_block, image.shape[3], image.shape[4]), seed=self.seed, device='cuda', dtype=torch.bfloat16)
+        noise_obs = self.generate_noise((image.shape[0], 16, self.num_frame_per_block, height//8, width//8), seed=self.seed, device='cuda', dtype=torch.bfloat16)
         noise_action = self.generate_noise((image.shape[0], self.action_horizon, self.model.action_dim), seed=self.seed, device='cuda', dtype=torch.bfloat16)
         batch_size, num_channels, num_frames, height, width = noise_obs.shape
         ######### Generate video #########
-        # DiT patch_embedding uses stride (1,2,2), so tokens per frame = (H//2)*(W//2)
-        tokens_per_frame = (height // 2) * (width // 2)
-        frame_seqlen = tokens_per_frame
-        seq_len = num_frames * frame_seqlen
+        # Match the DiT's (1, 2, 2) patch embedding tokenization on latent frames.
+        frame_seqlen = (height // 2) * (width // 2)
+        seq_len = frame_seqlen * num_frames
 
         image = image.transpose(1, 2)
         noise_obs = noise_obs.transpose(1, 2)
@@ -1359,10 +1351,13 @@ class WANPolicyHead(ActionHead):
         ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
         LOAD_TRT_ENGINE = os.getenv("LOAD_TRT_ENGINE", None)
 
-        # Torch compile the modules. Skip _forward_blocks: Dynamo with fullgraph can fail on
-        # shape variation (e.g. x [1,50,C] vs e [1,200,C]); the block aligns e to x at runtime.
+        # Torch compile the modules.
         if not ENABLE_TENSORRT:
-            print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules (Wan _forward_blocks not compiled).")
+            print("Torch compiling the Wan, TextEncoder, ImageEncoder, and VAE modules.")
+
+            self.model._forward_blocks = torch.compile(
+                mode="reduce-overhead", fullgraph=True, dynamic=False,
+            )(self.model._forward_blocks)
 
             self.text_encoder.forward = torch.compile(
                 mode="reduce-overhead", fullgraph=True, dynamic=False,
