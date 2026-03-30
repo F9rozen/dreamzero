@@ -107,15 +107,24 @@ class CheckpointFormatCallback(TrainerCallback):
     """
 
     def __init__(
-        self, run_name: str, exp_cfg_dir: Path | None = None, processor_dir: Path | None = None
+        self,
+        run_name: str,
+        exp_cfg_dir: Path | None = None,
+        processor_dir: Path | None = None,
+        save_deepspeed_checkpoint: bool = True,
     ):
         """
         Args:
             run_name: Name of the experiment run
             exp_cfg_dir: Path to the directory containing all experiment metadata
+            save_deepspeed_checkpoint: If False, delete the DeepSpeed ZeRO checkpoint
+                subdirectory (global_step*/) after each save to save disk space. The
+                safetensors weights needed for eval are kept; only optimizer states are
+                removed, so training cannot be resumed from this checkpoint.
         """
         self.exp_cfg_dir = exp_cfg_dir
         self.processor_dir = processor_dir
+        self.save_deepspeed_checkpoint = save_deepspeed_checkpoint
 
     def on_save(self, args, state, control, **kwargs):
         """Called after the trainer saves a checkpoint."""
@@ -143,6 +152,13 @@ class CheckpointFormatCallback(TrainerCallback):
             if wandb_config_src.exists():
                 print(f"Copying wandb_config.json from {wandb_config_src} to {wandb_config_dst}")
                 shutil.copy2(wandb_config_src, wandb_config_dst)
+
+            # Optionally remove DeepSpeed ZeRO optimizer-state checkpoint to save disk space.
+            if not self.save_deepspeed_checkpoint:
+                for p in checkpoint_dir.glob("global_step*"):
+                    if p.is_dir():
+                        print(f"Removing DeepSpeed checkpoint directory {p} (save_deepspeed_checkpoint=False)")
+                        shutil.rmtree(p)
 
 
 class ProfCallback(transformers.TrainerCallback):
@@ -471,12 +487,6 @@ class BaseTrainer(transformers.Trainer):
             )
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
-            # DeepSpeed CPU Adam (ZeRO offload) expects 'bias_correction' in each param group.
-            # HuggingFace Trainer's AdamW does not set it, causing KeyError in cpu_adam.step().
-            if getattr(self.args, "deepspeed", None):
-                for group in self.optimizer.param_groups:
-                    group.setdefault("bias_correction", True)
-
         return self.optimizer
 
     def save_model(self, output_dir: Optional[str], _internal_call: bool):
@@ -574,10 +584,8 @@ class BaseTrainer(transformers.Trainer):
             "collate_fn": data_collator,
             "num_workers": self.args.dataloader_num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
         }
-        # persistent_workers is only valid when num_workers > 0 (PyTorch raises otherwise)
-        if self.args.dataloader_num_workers > 0:
-            dataloader_params["persistent_workers"] = self.args.dataloader_persistent_workers
 
         return DataLoader(train_dataset, **dataloader_params)
 
@@ -805,12 +813,15 @@ class BaseExperiment(ABC):
         OmegaConf.save(cfg, exp_cfg_dir / "conf.yaml", resolve=True)
 
         run_name = cfg.training_args.get("run_name", None)
-        ckpt_format_callback = CheckpointFormatCallback(run_name=run_name, exp_cfg_dir=exp_cfg_dir)
+        ckpt_format_callback = CheckpointFormatCallback(
+            run_name=run_name,
+            exp_cfg_dir=exp_cfg_dir,
+            save_deepspeed_checkpoint=cfg.get("save_deepspeed_checkpoint", True),
+        )
         trainer.add_callback(ckpt_format_callback)
 
         loss_log_path = str(Path(training_args.output_dir) / "loss_log.jsonl")
         trainer.add_callback(LossLoggerCallback(output_path=loss_log_path))
-
 
         # Add profiling callback (local profiling only, no S3 upload)
         # Local: {output_dir}/profiling/rank_{id}/*.pt.trace.json

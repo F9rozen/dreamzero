@@ -1,9 +1,39 @@
-import os
 import random
 from typing import Any, Dict, List, Optional
+import os
 
 from einops import rearrange
 import numpy as np
+
+# ===== DEBUG: image saving =====
+_DEBUG_SAVE_DIR = os.environ.get("DEBUG_SAVE_DIR", "/tmp/dreamzero_debug_images")
+_DEBUG_MAX_SAVES = int(os.environ.get("DEBUG_MAX_SAVES", "5"))
+_debug_save_counter = 0  # module-level counter, shared across all DreamTransform instances
+
+
+def _debug_save_images(concat_images: np.ndarray, tag: str = "libero"):
+    """Save concatenated video frames for debugging. Only saves first _DEBUG_MAX_SAVES calls."""
+    global _debug_save_counter
+    if _debug_save_counter >= _DEBUG_MAX_SAVES:
+        return
+    try:
+        from PIL import Image
+        os.makedirs(_DEBUG_SAVE_DIR, exist_ok=True)
+        # concat_images: (1, T, C, H, W), values in [0, 255] uint8
+        frames = concat_images[0]  # (T, C, H, W)
+        n_save = min(4, frames.shape[0])  # save first 4 frames
+        for i in range(n_save):
+            frame_chw = frames[i]  # (C, H, W)
+            frame_hwc = frame_chw.transpose(1, 2, 0)  # (H, W, C)
+            img = Image.fromarray(frame_hwc.astype(np.uint8))
+            save_path = os.path.join(_DEBUG_SAVE_DIR, f"{tag}_sample{_debug_save_counter:03d}_frame{i:02d}.png")
+            img.save(save_path)
+        print(f"[DEBUG] Saved {n_save} frames to {_DEBUG_SAVE_DIR} (sample {_debug_save_counter}, shape={concat_images.shape})")
+        _debug_save_counter += 1
+    except Exception as e:
+        print(f"[DEBUG] Image save failed: {e}")
+# ===== END DEBUG =====
+
 from pydantic import Field, PrivateAttr
 import torch
 from transformers import AutoProcessor, ProcessorMixin, AutoTokenizer
@@ -39,17 +69,12 @@ class HuggingfaceTokenizer:
 
     def __init__(self, name, seq_len=None, clean=None, **kwargs):
         assert clean in (None, 'whitespace')
-        self.name = name
+        self.name = resolve_local_tokenizer_path(name)
         self.seq_len = seq_len
         self.clean = clean
 
-        # When loading from a local checkpoint path (e.g. from training runs), pass
-        # local_files_only=True to avoid HFValidationError from validate_repo_id.
-        load_kwargs = dict(kwargs)
-        if os.path.isdir(name):
-            load_kwargs.setdefault("local_files_only", True)
         # init tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(name, **load_kwargs)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.name, **kwargs)
         self.vocab_size = self.tokenizer.vocab_size
 
     def __call__(self, sequence, **kwargs):
@@ -89,6 +114,30 @@ class HuggingfaceTokenizer:
         return text
 
 
+DEFAULT_LOCAL_TOKENIZER_DIR = "/mnt/project_rlinf_hs/yuanhuining/models/umt5-xxl"
+DEFAULT_LOCAL_WAN_TOKENIZER_DIR = "/mnt/project_rlinf_hs/yuanhuining/models/Wan2.1-I2V-14B-480P/google/umt5-xxl"
+
+
+def resolve_local_tokenizer_path(name: str) -> str:
+    if os.path.isdir(name):
+        return name
+
+    env_tokenizer_dir = os.environ.get("DREAMZERO_TOKENIZER_PATH")
+    candidates = [
+        env_tokenizer_dir,
+        DEFAULT_LOCAL_TOKENIZER_DIR,
+        DEFAULT_LOCAL_WAN_TOKENIZER_DIR,
+    ]
+    # Fall back to local candidates if name is the HF model name OR an absolute
+    # path that no longer exists on this machine (e.g. stale path baked into a
+    # checkpoint config from a different host).
+    if name == "google/umt5-xxl" or os.path.isabs(name):
+        for candidate in candidates:
+            if candidate and os.path.isdir(candidate):
+                return candidate
+    return name
+
+
 def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodiment_tag_mapping=None) -> dict:
     batch = {}
     keys = features[0].keys()
@@ -124,6 +173,8 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + processed_item.lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
                         processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + processed_item.lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.LIBERO_SIM.value]:
+                        processed_item = "A multi-view video shows that a robot " + processed_item.lower() + " The video is split into two horizontal views: the left view shows the exterior camera and the right view shows the wrist camera. The robot " + processed_item.lower()
                     else:
                         raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.") 
                     output_values.append(processed_item)  
@@ -146,6 +197,8 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the camera view from the robot's head, the top-right view shows the camera view from the right hand, the bottom-left view shows the camera view from the left hand, and the bottom-right view is a black screen (inactive view). The robot " + str(item).lower()
                     elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.YAM.value]:
                         item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into four views: The top-left view shows the top camera, the top-right view shows the right camera, the bottom-left view shows the left camera, and the bottom-right view is a black screen. The robot " + str(item).lower()
+                    elif elem["embodiment_id"] == embodiment_tag_mapping[EmbodimentTag.LIBERO_SIM.value]:
+                        item = "A multi-view video shows that a robot " + str(item).lower() + " The video is split into two horizontal views: the left view shows the exterior camera and the right view shows the wrist camera. The robot " + str(item).lower()
                     else:
                         raise ValueError(f"Embodiment ID {elem['embodiment_id']} not supported.")   
                     output_values.append(item)
@@ -160,7 +213,11 @@ def collate(features: List[dict], tokenizer: AutoTokenizer, num_views=3, embodim
             batch['text_attention_mask_negative'] = mask
         else:
             values = [elem[key] for elem in features]
-            batch[key] = torch.from_numpy(np.stack(values))
+            try:
+                batch[key] = torch.from_numpy(np.stack(values))
+            except ValueError as e:
+                shapes = [np.asarray(v).shape for v in values]
+                raise ValueError(f"Shape mismatch in collate for key='{key}': shapes={shapes}") from e
     return batch
 
 
@@ -354,6 +411,15 @@ class DreamTransform(InvertibleModalityTransform):
 
                 return concat_images
             
+            if self.embodiment_tag == EmbodimentTag.LIBERO_SIM and v >= 2:
+                concat_images = np.zeros((1, t, c, h, 2 * w), dtype=images.dtype)
+                concat_images[0, :, :, :, :w] = images[0]
+                concat_images[0, :, :, :, w:] = images[1]
+                if _debug_save_counter < _DEBUG_MAX_SAVES:
+                    print(f"[DEBUG][_prepare_video] LIBERO_SIM: raw images shape (v,t,c,h,w)={images.shape}, concat_images shape={concat_images.shape}")
+                _debug_save_images(concat_images, tag="libero_sim")
+                return concat_images
+
             # For other embodiments: use 2x2 grid layout
             # Layout: [head, right]
             #         [left, black]
@@ -452,23 +518,22 @@ class DreamTransform(InvertibleModalityTransform):
             return state, state_mask, n_state_tokens
 
         state = data["state"]
+
         assert state.shape[0] % self.state_horizon == 0, f"{state.shape=}, {self.state_horizon=}"
 
         n_state_dims = state.shape[-1]
 
-        # Instead of asserting, just take the first max_state_dim dimensions if needed
+        # Normalize feature dim to max_state_dim
         if n_state_dims > self.max_state_dim:
             state = state[:, : self.max_state_dim]
             n_state_dims = self.max_state_dim
         else:
-            # Pad up to max_state_dim if smaller
             state = np.pad(state, ((0, 0), (0, self.max_state_dim - n_state_dims)), "constant")
 
         # Create mask for real state dims
         state_mask = np.zeros_like(state).astype(bool)
         state_mask[:, :n_state_dims] = True
 
-        # We only have 1 "proprio" token to represent the entire state
         n_state_tokens = state.shape[0]
         return state, state_mask, n_state_tokens
 
@@ -483,6 +548,7 @@ class DreamTransform(InvertibleModalityTransform):
             return actions, actions_mask, n_action_tokens
 
         actions = data["action"]
+
         assert actions.shape[0] % self.action_horizon == 0, f"{actions.shape=}, {self.action_horizon=}"
 
         n_action_tokens = actions.shape[0]  # T
@@ -510,11 +576,15 @@ class DreamTransform(InvertibleModalityTransform):
         language, is_lapa_instance, is_dream_instance, is_cotrain_instance = self._prepare_language(data)
         batch_data = {"images": images, "language": language}
         vlm_outputs = self._apply_vlm_processing(batch_data)
+        if _debug_save_counter < _DEBUG_MAX_SAVES:
+            print(f"[DEBUG][apply_single] vlm_outputs['images'] shape={vlm_outputs['images'].shape}, language='{language[:80]}...'")
 
         # 2) Prepare state
         state, state_mask, _ = self._prepare_state(data)
         transformed_data["state"] = state
         transformed_data["state_mask"] = state_mask
+        if _debug_save_counter < _DEBUG_MAX_SAVES:
+            print(f"[DEBUG][apply_single] state shape={state.shape}, state_mask shape={state_mask.shape}")
 
         if self.training:
             # 3) Prepare actions
@@ -530,6 +600,8 @@ class DreamTransform(InvertibleModalityTransform):
             actions, actions_mask, _ = self._prepare_action(data)
             transformed_data["action"] = actions
             transformed_data["action_mask"] = actions_mask
+            if _debug_save_counter < _DEBUG_MAX_SAVES:
+                print(f"[DEBUG][apply_single] action shape={actions.shape}, action_mask shape={actions_mask.shape}")
 
             # default for lapa instance
             transformed_data["lapa_action"] = np.zeros_like(transformed_data["action"])
@@ -627,4 +699,3 @@ class DreamTransform(InvertibleModalityTransform):
 
     def __call__(self, data: dict) -> dict:
         return self.apply(data)
-

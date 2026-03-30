@@ -1,5 +1,6 @@
 import importlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,6 +18,136 @@ import time
 
 from groot.vla.data.schema import DatasetMetadata, EmbodimentTag
 from groot.vla.data.transform import ComposedModalityTransform
+
+
+def _load_local_libero_eval_cfg() -> OmegaConf:
+    cfg_path = (
+        Path(__file__).resolve().parents[2]
+        / "configs"
+        / "data"
+        / "dreamzero"
+        / "base_48_wan_fine_aug_relative.yaml"
+    )
+    cfg = OmegaConf.load(cfg_path)
+    cfg.image_resolution_width = 256
+    cfg.image_resolution_height = 256
+    return cfg
+
+
+def _load_local_embodiment_mapping() -> dict[str, int]:
+    cfg_path = (
+        Path(__file__).resolve().parents[2]
+        / "configs"
+        / "model"
+        / "dreamzero"
+        / "transform"
+        / "base.yaml"
+    )
+    cfg = OmegaConf.load(cfg_path)
+    return dict(cfg.embodiment_tag_to_projector_index)
+
+
+def _build_libero_eval_metadata() -> dict[str, Any]:
+    libero_root = Path(
+        os.environ.get(
+            "LIBERO_DATA_ROOT",
+            "/mnt/project_rlinf_hs/yuanhuining/datasets/libero",
+        )
+    )
+    info_path = libero_root / "meta" / "info.json"
+    stats_path = libero_root / "meta" / "stats.json"
+    with open(info_path, "r") as f:
+        info = json.load(f)
+    with open(stats_path, "r") as f:
+        stats = json.load(f)
+
+    def _stat_block(raw: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "max": raw["max"],
+            "min": raw["min"],
+            "mean": raw["mean"],
+            "std": raw["std"],
+            "q01": raw.get("q01", raw["min"]),
+            "q99": raw.get("q99", raw["max"]),
+        }
+
+    image_shape = info["features"]["image"]["shape"]
+    wrist_shape = info["features"]["wrist_image"]["shape"]
+    state_shape = info["features"]["state"]["shape"]
+    action_shape = info["features"]["actions"]["shape"]
+    fps = info["fps"]
+
+    return {
+        "statistics": {
+            "state": {"state": _stat_block(stats["state"])},
+            "action": {"actions": _stat_block(stats["actions"])},
+        },
+        "modalities": {
+            "video": {
+                "image": {
+                    "resolution": image_shape[:2],
+                    "channels": image_shape[2],
+                    "fps": fps,
+                },
+                "wrist_image": {
+                    "resolution": wrist_shape[:2],
+                    "channels": wrist_shape[2],
+                    "fps": fps,
+                },
+            },
+            "state": {
+                "state": {
+                    "absolute": True,
+                    "rotation_type": None,
+                    "shape": state_shape,
+                    "continuous": True,
+                }
+            },
+            "action": {
+                "actions": {
+                    "absolute": True,
+                    "rotation_type": None,
+                    "shape": action_shape,
+                    "continuous": True,
+                }
+            },
+        },
+        "embodiment_tag": EmbodimentTag.LIBERO_SIM.value,
+    }
+
+
+def _ensure_libero_eval_support(
+    train_cfg: OmegaConf, metadatas: dict[str, Any], embodiment_tag: EmbodimentTag
+) -> tuple[OmegaConf, dict[str, Any]]:
+    if embodiment_tag != EmbodimentTag.LIBERO_SIM:
+        return train_cfg, metadatas
+
+    local_cfg = _load_local_libero_eval_cfg()
+    local_mapping = _load_local_embodiment_mapping()
+    train_cfg.image_resolution_width = local_cfg.image_resolution_width
+    train_cfg.image_resolution_height = local_cfg.image_resolution_height
+    train_cfg.modality_config_libero = local_cfg.modality_config_libero
+    train_cfg.transform_libero = local_cfg.transform_libero
+    if embodiment_tag.value not in train_cfg.transforms:
+        train_cfg.transforms[embodiment_tag.value] = local_cfg.transforms[embodiment_tag.value]
+    if embodiment_tag.value not in train_cfg.modality_configs:
+        train_cfg.modality_configs[embodiment_tag.value] = local_cfg.modality_configs[
+            embodiment_tag.value
+        ]
+    if hasattr(train_cfg, "embodiment_tag_to_projector_index"):
+        for key, value in local_mapping.items():
+            if key not in train_cfg.embodiment_tag_to_projector_index:
+                train_cfg.embodiment_tag_to_projector_index[key] = value
+    if (
+        hasattr(train_cfg, "model_specific_transform")
+        and hasattr(train_cfg.model_specific_transform, "embodiment_tag_mapping")
+    ):
+        for key, value in local_mapping.items():
+            if key not in train_cfg.model_specific_transform.embodiment_tag_mapping:
+                train_cfg.model_specific_transform.embodiment_tag_mapping[key] = value
+    if embodiment_tag.value not in metadatas:
+        metadatas[embodiment_tag.value] = _build_libero_eval_metadata()
+    return train_cfg, metadatas
 
 
 class ModelManager:
@@ -202,27 +333,6 @@ class BaseGrootSimPolicy(BaseTianshouPolicy):
         return {}
 
 
-def _update_tokenizer_path_in_config(cfg, new_path: str) -> None:
-    """Update tokenizer_path in the transforms subtree only (avoids trainer.model etc.)."""
-    from omegaconf import DictConfig, ListConfig
-    if isinstance(cfg, DictConfig):
-        if "tokenizer_path" in cfg:
-            cfg.tokenizer_path = new_path
-        # Only recurse via "transforms" to avoid triggering resolution of trainer, etc.
-        if "transforms" not in cfg:
-            return
-        sub = cfg.transforms
-        if isinstance(sub, DictConfig):
-            for v in sub.values():
-                _update_tokenizer_path_in_config(v, new_path)
-        elif isinstance(sub, ListConfig):
-            for v in sub:
-                _update_tokenizer_path_in_config(v, new_path)
-    elif isinstance(cfg, ListConfig):
-        for v in cfg:
-            _update_tokenizer_path_in_config(v, new_path)
-
-
 class GrootSimPolicy(BaseGrootSimPolicy):
     def __init__(
         self,
@@ -230,7 +340,6 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         model_path: str,
         device: int | str,
         model_config_overrides: list[str] | None = [],
-        tokenizer_path_override: str | None = None,
         skip_assert_delta_indices: bool = False,
         skip_img_transform: bool = False,
         lazy_load: bool = False,
@@ -253,8 +362,6 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         exp_cfg_dir = model_dir / "experiment_cfg"
         train_cfg_path = exp_cfg_dir / "conf.yaml"
         train_cfg = OmegaConf.load(train_cfg_path)
-        if tokenizer_path_override is not None:
-            _update_tokenizer_path_in_config(train_cfg, tokenizer_path_override)
         self.train_cfg = train_cfg
         self.lazy_load = lazy_load
 
@@ -360,22 +467,13 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         metadata_path = exp_cfg_dir / "metadata.json"
         with open(metadata_path, "r") as f:
             metadatas = json.load(f)
+        train_cfg, metadatas = _ensure_libero_eval_support(
+            train_cfg, metadatas, self.embodiment_tag
+        )
+        self.train_cfg = train_cfg
         if "gr1_unified_offline_rl" in metadatas and self.embodiment_tag.value == "gr1_unified":
             self.embodiment_tag = EmbodimentTag.GR1_UNIFIED_OFFLINE_RL
         metadata = DatasetMetadata.model_validate(metadatas[self.embodiment_tag.value])
-
-        # If the model's action head has target_video_height/width (e.g. DreamZero Wan 5B), use that
-        # as the expected video resolution so the transform matches the model. metadata.json can
-        # otherwise contain a different resolution (e.g. 180x320) from dataset config.
-        if hasattr(self.trained_model, "action_head") and hasattr(
-            self.trained_model.action_head, "config"
-        ):
-            cfg = self.trained_model.action_head.config
-            target_h = getattr(cfg, "target_video_height", None)
-            target_w = getattr(cfg, "target_video_width", None)
-            if target_h is not None and target_w is not None and metadata.modalities.video:
-                for key in metadata.modalities.video.keys():
-                    metadata.modalities.video[key].resolution = (int(target_w), int(target_h))
 
         # 2.2. Get the eval transforms
         assert (
@@ -556,11 +654,10 @@ class GrootSimPolicy(BaseGrootSimPolicy):
                 # Try to find the state data - check multiple possible key formats
                 last_state = None
                 
-                
-                if last_state is None and state_key in obs:
-                    # Format 1: Direct key like "state.joint_position"
+                # Format 1: Direct key like "state.joint_position"
+                if state_key in obs:
                     last_state = obs[state_key]
-                elif last_state is None:
+                else:
                     # Format 2: Search for keys containing both "state" and the key name
                     for obs_key in obs.keys():
                         if 'state' in obs_key and key in obs_key:

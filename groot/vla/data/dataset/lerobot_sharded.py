@@ -1,14 +1,19 @@
 from concurrent.futures import Future, ThreadPoolExecutor
+from io import BytesIO
 import json
+import logging
 from pathlib import Path
 import time
 
 import numpy as np
 import pandas as pd
+from PIL import Image
 import torch
 import torch.distributed as dist
 from torch.utils.data import IterableDataset, get_worker_info
 import yaml
+
+logger = logging.getLogger(__name__)
 
 from groot.vla.common.utils import get_frames_by_timestamps
 
@@ -1219,11 +1224,8 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
             # Only add if it doesn't exceed trajectory bounds and max_frames
             if additional_idx < trajectory_length and unique_sorted.size < max_frames:
                 unique_sorted = np.append(unique_sorted, additional_idx)
-            else:
-                # Trim to 8n+1 format. Require at least 9 frames so (noisy_frames-1)//num_frame_per_block >= 1
-                # for action/state model invariant (CausalWanModel); otherwise return empty so sample is skipped.
-                if unique_sorted.size <= 8:
-                    return np.array([])
+            else: 
+                # print("additional_idx", additional_idx, trajectory_length, unique_sorted.size, max_frames)
                 unique_sorted = unique_sorted[:-7]
         
         # ensure that unique_sorted has 4n+1 frames
@@ -1276,6 +1278,401 @@ class ShardedLeRobotSubLangSingleActionChunkDatasetDROID(LeRobotSingleDataset):
         # self._traj_cache[trajectory_id] = traj_data
         return traj_data
 
+
+
+class ShardedLeRobotSubLangSingleActionChunkDatasetLIBERO(
+    ShardedLeRobotSubLangSingleActionChunkDatasetDROID
+):
+    """Sharded loader for image-backed LIBERO LeRobot datasets."""
+
+    VIDEO_CHUNK_OFFSETS = [0, 2, 4, 6, 8, 10, 12, 14]
+    VIDEO_CHUNK_STRIDE = 16
+    ACTION_CHUNK_SIZE = 16
+
+    def get_all_video_paths(self) -> dict[int, dict[str, Path]]:
+        video_paths = {}
+        for trajectory_id in self.trajectory_ids:
+            if isinstance(trajectory_id, np.integer):
+                trajectory_id = trajectory_id.item()
+            video_paths[trajectory_id] = {}
+        return video_paths
+
+    @staticmethod
+    def _decode_image_sequence(parquet_df: pd.DataFrame, original_key: str) -> np.ndarray:
+        frames = []
+        for encoded in parquet_df[original_key]:
+            image = Image.open(BytesIO(encoded["bytes"])).convert("RGB")
+            frames.append(np.asarray(image))
+        return np.stack(frames, axis=0)
+
+    @staticmethod
+    def get_shard(
+        trajectory_ids: list[int] | np.ndarray,
+        modality_keys: dict,
+        video_paths: dict[int, dict[str, Path]],
+        parquet_paths: dict[int, Path],
+        video_backend: str = "pyav",
+        video_backend_kwargs: dict | None = None,
+        fps: float = None,
+    ) -> tuple[dict[str, np.ndarray], dict[int, int], pd.DataFrame]:
+        del video_paths, video_backend, video_backend_kwargs, fps
+        logger.info("Caching shard")
+        start_time = time.time()
+        assert "video" in modality_keys, "No video modality found. No need to use caching."
+
+        # Build task_index -> task text lookup from tasks.jsonl if available.
+        first_parquet_path = next(iter(parquet_paths.values()))
+        tasks_jsonl = first_parquet_path.parents[2] / "meta" / "tasks.jsonl"
+        task_lookup: dict[int, str] = {}
+        if tasks_jsonl.exists():
+            with open(tasks_jsonl) as f:
+                for line in f:
+                    entry = json.loads(line)
+                    task_lookup[entry["task_index"]] = entry["task"]
+
+        cached_frames = {}
+        trajectory_start_indices = {}
+        curr_step_index = 0
+        cached_df = None
+        for trajectory_id in trajectory_ids:
+            trajectory_start_indices[trajectory_id] = curr_step_index
+            parquet_path = parquet_paths[trajectory_id]
+            parquet_df = pd.read_parquet(parquet_path)
+            trajectory_length = len(parquet_df)
+            if isinstance(trajectory_id, np.integer):
+                trajectory_id = trajectory_id.item()
+            assert isinstance(
+                trajectory_id, int
+            ), f"trajectory_id must be an integer, got {type(trajectory_id)}"
+            for key in modality_keys["video"]:
+                assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
+                if key not in cached_frames:
+                    cached_frames[key] = []
+                original_key = key.replace("video.", "")
+                frames = ShardedLeRobotSubLangSingleActionChunkDatasetLIBERO._decode_image_sequence(
+                    parquet_df, original_key
+                )
+                cached_frames[key].append(frames)
+            if cached_df is None:
+                cached_df = parquet_df
+            else:
+                cached_df = pd.concat([cached_df, parquet_df])
+            curr_step_index += trajectory_length
+
+        for key in cached_frames:
+            cached_frames[key] = np.concatenate(cached_frames[key], axis=0)
+        end_time = time.time()
+        logger.info("Cached shard in %.2f seconds", end_time - start_time)
+        assert cached_df is not None, "Cached dataframe is None"
+        if "index" not in cached_df.columns:
+            cached_df = cached_df.reset_index(drop=True)
+            cached_df["index"] = cached_df.index
+        # Add task_text column so annotation can be a proper language string.
+        if task_lookup and "task_index" in cached_df.columns:
+            cached_df["task_text"] = cached_df["task_index"].map(task_lookup).fillna("")
+        return cached_frames, trajectory_start_indices, cached_df
+
+    def _uniform_sample_from_language_ranges(
+        self,
+        step_indices: np.ndarray,
+        language_annotations: np.ndarray,
+        trajectory_length: int,
+    ) -> np.ndarray:
+        """Uniformly sample LIBERO frames so each chunk spans 1.6s at 10fps.
+
+        Each chunk contributes 8 video frames sampled every 2 environment steps,
+        plus one final conditioning frame across the whole sample:
+        [0, 2, 4, 6, 8, 10, 12, 14] per 16-step chunk.
+        """
+        if len(step_indices) == 0:
+            return np.array([])
+
+        first_idx = max(0, min(step_indices[0], trajectory_length - 1))
+        target_language = language_annotations[first_idx]
+
+        max_frames = 8 * self.max_chunk_size + 1
+        per_step_offsets = self.VIDEO_CHUNK_OFFSETS
+        sampled_list: list[int] = []
+
+        def add_step_set(anchor_index: int) -> None:
+            nonlocal sampled_list
+            if anchor_index < 0 or anchor_index + per_step_offsets[-1] >= trajectory_length:
+                return
+            if len(sampled_list) + len(per_step_offsets) > max_frames:
+                return
+            for offset in per_step_offsets:
+                sampled_list.append(int(anchor_index + offset))
+
+        add_step_set(first_idx)
+
+        step = 1
+        back_done = False
+        fwd_done = False
+        while len(sampled_list) < max_frames and (not back_done or not fwd_done):
+            if not back_done:
+                back_anchor = first_idx - self.VIDEO_CHUNK_STRIDE * step
+                if back_anchor < 0:
+                    back_done = True
+                elif language_annotations[back_anchor] != target_language:
+                    back_done = True
+                else:
+                    add_step_set(back_anchor)
+            if len(sampled_list) >= max_frames:
+                break
+            if not fwd_done:
+                fwd_anchor = first_idx + self.VIDEO_CHUNK_STRIDE * step
+                if fwd_anchor >= trajectory_length:
+                    fwd_done = True
+                elif language_annotations[fwd_anchor] != target_language:
+                    fwd_done = True
+                else:
+                    add_step_set(fwd_anchor)
+            step += 1
+
+        if len(sampled_list) == 0:
+            return np.array([])
+
+        unique_sorted = np.array(sorted(set(sampled_list)), dtype=int)
+        if unique_sorted.size > max_frames:
+            unique_sorted = unique_sorted[:max_frames]
+
+        if unique_sorted.size > 0:
+            additional_idx = unique_sorted[-1] + 2
+            if additional_idx < trajectory_length and unique_sorted.size < max_frames:
+                unique_sorted = np.append(unique_sorted, additional_idx)
+            else:
+                # Drop the last incomplete chunk (VIDEO_CHUNK_OFFSETS has N entries; keep N-1
+                # to form a valid 8n+1 sequence with the conditioning frame).
+                trim = len(self.VIDEO_CHUNK_OFFSETS) - 1
+                unique_sorted = unique_sorted[:-trim]
+
+        assert unique_sorted.size % 8 == 1, f"unique_sorted size {unique_sorted.size} is not 8n+1"
+
+        num_video_chunks = (unique_sorted.size - 1) // 8
+        # Store as a scalar so sequential state/action sampling for the same item can read it
+        # without key-collision issues caused by different trajectories sharing the same local
+        # frame index.
+        self._last_num_chunks: int = num_video_chunks
+
+        return unique_sorted
+
+    def _get_language_annotation_key(self) -> str | None:
+        """Return the parquet column name for the language annotation, or None."""
+        for modality_name in self.modality_keys:
+            for modality_key in self.modality_keys[modality_name]:
+                if modality_key.startswith("annotation."):
+                    ann_subkey = modality_key.replace("annotation.", "")
+                    return self.lerobot_modality_meta.annotation[ann_subkey].original_key
+        return None
+
+    def _sample_lang_boundary_indices(
+        self,
+        first_idx: int,
+        language_annotations: np.ndarray,
+        trajectory_length: int,
+        target_num_chunks: int | None,
+        chunk_size: int,
+    ) -> np.ndarray:
+        """Sample step indices within the same language segment.
+
+        Walks backward and forward from *first_idx* in strides of VIDEO_CHUNK_STRIDE,
+        stopping when the language annotation changes or the trajectory ends.  Each
+        anchor contributes *chunk_size* consecutive steps (use chunk_size=1 for state
+        anchors and chunk_size=ACTION_CHUNK_SIZE for action chunks).
+
+        Returns a sorted array of step indices whose length is a multiple of chunk_size.
+        """
+        max_total = chunk_size * self.max_chunk_size
+        target_language = language_annotations[first_idx]
+        sampled_list: list[int] = []
+
+        def add_chunk(anchor: int) -> None:
+            if anchor < 0 or anchor + chunk_size - 1 >= trajectory_length:
+                return
+            if len(sampled_list) + chunk_size > max_total:
+                return
+            if target_num_chunks is not None and len(sampled_list) // chunk_size >= target_num_chunks:
+                return
+            for offset in range(chunk_size):
+                sampled_list.append(anchor + offset)
+
+        add_chunk(first_idx)
+
+        step = 1
+        back_done = False
+        fwd_done = False
+        while len(sampled_list) < max_total and (not back_done or not fwd_done):
+            if target_num_chunks is not None and len(sampled_list) // chunk_size >= target_num_chunks:
+                break
+            if not back_done:
+                back_anchor = first_idx - self.VIDEO_CHUNK_STRIDE * step
+                if back_anchor < 0 or language_annotations[back_anchor] != target_language:
+                    back_done = True
+                else:
+                    add_chunk(back_anchor)
+            if len(sampled_list) >= max_total:
+                break
+            if not fwd_done:
+                fwd_anchor = first_idx + self.VIDEO_CHUNK_STRIDE * step
+                if fwd_anchor >= trajectory_length or language_annotations[fwd_anchor] != target_language:
+                    fwd_done = True
+                else:
+                    add_chunk(fwd_anchor)
+            step += 1
+
+        if not sampled_list:
+            return np.array([], dtype=int)
+        unique_sorted = np.array(sorted(set(sampled_list)), dtype=int)
+        capped = min(unique_sorted.size, max_total)
+        divisible = (capped // chunk_size) * chunk_size
+        return unique_sorted[:divisible]
+
+    def get_state(
+        self,
+        trajectory_id: int,
+        modality: str,
+        key: str,
+        step_indices: np.ndarray,
+    ) -> np.ndarray:
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        max_length = self.trajectory_lengths[trajectory_index]
+
+        if key == "action.task_progress":
+            frame_index_array = self.curr_traj_data["frame_index"].to_numpy()
+            frame_index = self.retrieve_data_and_pad(
+                array=frame_index_array,
+                step_indices=step_indices,
+                max_length=max_length,
+                padding_strategy="first_last",
+            )
+            progress = frame_index / max_length
+            return progress.reshape(-1, 1)
+
+        assert key.startswith(modality + "."), f"{key} must start with {modality + '.'}, got {key}"
+        field_subkey = key.replace(modality + ".", "")
+        le_cfg = getattr(self.lerobot_modality_meta, modality)
+        le_key = le_cfg[field_subkey].original_key or field_subkey
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        assert le_key in self.curr_traj_data.columns, f"No {le_key} found in {trajectory_id=}"
+        data_array: np.ndarray = np.stack(self.curr_traj_data[le_key])  # type: ignore
+        if data_array.ndim == 1:
+            assert data_array.shape[0] == max_length, (
+                f"Expected 1D array with length {max_length}, got {data_array.shape} array"
+            )
+            data_array = data_array.reshape(-1, 1)
+        assert data_array.ndim == 2, f"Expected 2D array, got {data_array.shape} array"
+        le_indices = np.arange(le_cfg[field_subkey].start, le_cfg[field_subkey].end)
+        data_array = data_array[:, le_indices]
+        state_cfg = getattr(self.metadata.modalities, modality)[field_subkey]
+
+        trajectory_length = self.trajectory_lengths[trajectory_index]
+        traj_data = self.get_trajectory_data(trajectory_id)
+        language_key = self._get_language_annotation_key()
+
+        if language_key is not None and language_key in traj_data.columns and len(step_indices) > 0:
+            language_annotations = traj_data[language_key].values
+            first_idx = max(0, min(int(step_indices[0]), trajectory_length - 1))
+            sampled_indices = self._sample_lang_boundary_indices(
+                first_idx=first_idx,
+                language_annotations=language_annotations,
+                trajectory_length=trajectory_length,
+                target_num_chunks=getattr(self, "_last_num_chunks", None),
+                chunk_size=1,  # one anchor per video chunk
+            )
+        else:
+            sampled_indices = np.clip(step_indices, 0, trajectory_length - 1)
+
+        return self.retrieve_data_and_pad(
+            array=data_array,
+            step_indices=sampled_indices,
+            max_length=max_length,
+            padding_strategy="first_last" if state_cfg.absolute else "zero",
+        )
+
+    def get_action(
+        self,
+        trajectory_id: int,
+        modality: str,
+        key: str,
+        step_indices: np.ndarray,
+    ) -> np.ndarray:
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        max_length = self.trajectory_lengths[trajectory_index]
+
+        if key == "action.task_progress":
+            frame_index_array = self.curr_traj_data["frame_index"].to_numpy()
+            frame_index = self.retrieve_data_and_pad(
+                array=frame_index_array,
+                step_indices=step_indices,
+                max_length=max_length,
+                padding_strategy="first_last",
+            )
+            progress = frame_index / max_length
+            return progress.reshape(-1, 1)
+
+        assert key.startswith(modality + "."), f"{key} must start with {modality + '.'}, got {key}"
+        field_subkey = key.replace(modality + ".", "")
+        le_cfg = getattr(self.lerobot_modality_meta, modality)
+        le_key = le_cfg[field_subkey].original_key or field_subkey
+        assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
+        assert le_key in self.curr_traj_data.columns, f"No {le_key} found in {trajectory_id=}"
+        data_array: np.ndarray = np.stack(self.curr_traj_data[le_key])  # type: ignore
+        if data_array.ndim == 1:
+            assert data_array.shape[0] == max_length, (
+                f"Expected 1D array with length {max_length}, got {data_array.shape} array"
+            )
+            data_array = data_array.reshape(-1, 1)
+        assert data_array.ndim == 2, f"Expected 2D array, got {data_array.shape} array"
+        le_indices = np.arange(le_cfg[field_subkey].start, le_cfg[field_subkey].end)
+        data_array = data_array[:, le_indices]
+        action_cfg = getattr(self.metadata.modalities, modality)[field_subkey]
+
+        trajectory_length = self.trajectory_lengths[trajectory_index]
+        traj_data = self.get_trajectory_data(trajectory_id)
+        language_key = self._get_language_annotation_key()
+
+        if language_key is not None and language_key in traj_data.columns and len(step_indices) > 0:
+            language_annotations = traj_data[language_key].values
+            first_idx = max(0, min(int(step_indices[0]), trajectory_length - 1))
+            sampled_indices = self._sample_lang_boundary_indices(
+                first_idx=first_idx,
+                language_annotations=language_annotations,
+                trajectory_length=trajectory_length,
+                target_num_chunks=getattr(self, "_last_num_chunks", None),
+                chunk_size=self.ACTION_CHUNK_SIZE,
+            )
+        else:
+            sampled_indices = np.clip(step_indices, 0, trajectory_length - 1)
+
+        action_data = self.retrieve_data_and_pad(
+            array=data_array,
+            step_indices=sampled_indices,
+            max_length=max_length,
+            padding_strategy="first_last" if action_cfg.absolute else "zero",
+        )
+        should_convert_to_relative = (
+            (self.relative_action or self.relative_action_per_horizon)
+            and len(sampled_indices) > 0
+            and (self.relative_action_keys is None or field_subkey in self.relative_action_keys)
+        )
+        if should_convert_to_relative:
+            action_data = self._convert_to_relative_action(
+                action_data=action_data,
+                action_key=key,
+                sampled_indices=sampled_indices,
+                trajectory_id=trajectory_id,
+                chunk_size=self.ACTION_CHUNK_SIZE,
+            )
+
+        return action_data
+
+    def get_step_data(self, trajectory_id: int, indices: dict) -> dict | None:
+        data = super().get_step_data(trajectory_id, indices)
+        if data is None:
+            return None
+        if getattr(self, "_last_num_chunks", self.max_chunk_size) < self.max_chunk_size:
+            return None
+        return data
 
 
 class ShardedLeRobotMixtureDataset(LeRobotMixtureDataset, IterableDataset):

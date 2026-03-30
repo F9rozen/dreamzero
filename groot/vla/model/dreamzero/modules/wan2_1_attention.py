@@ -35,48 +35,6 @@ except ModuleNotFoundError:
 import warnings
 
 
-def _gpu_supports_flash_attention():
-    """FlashAttention requires Ampere (compute capability 8.0) or newer."""
-    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
-        return False
-    try:
-        if not torch.cuda.is_available():
-            return False
-        cap = torch.cuda.get_device_capability()
-        return cap[0] >= 8
-    except Exception:
-        return False
-
-
-def _sdpa_attention_fallback(
-    q, k, v,
-    q_lens=None,
-    k_lens=None,
-    dropout_p=0.,
-    softmax_scale=None,
-    q_scale=None,
-    causal=False,
-    dtype=torch.bfloat16,
-):
-    """PyTorch SDPA fallback for GPUs that don't support FlashAttention (e.g. pre-Ampere)."""
-    if q_lens is not None or k_lens is not None:
-        warnings.warn(
-            'Padding mask is disabled when using scaled_dot_product_attention on this GPU. '
-            'It can have a slight impact on quality.'
-        )
-    q = q.transpose(1, 2).to(dtype)
-    k = k.transpose(1, 2).to(dtype)
-    v = v.transpose(1, 2).to(dtype)
-    if q_scale is not None:
-        q = q * q_scale
-    if softmax_scale is not None:
-        q = q * softmax_scale
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, attn_mask=None, is_causal=causal, dropout_p=dropout_p
-    )
-    return out.transpose(1, 2).contiguous()
-
-
 def flash_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -117,19 +75,6 @@ def flash_attention(
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
     assert q.device.type == 'cuda' and q.size(-1) <= 256
-
-    # Use PyTorch SDPA on pre-Ampere GPUs (FlashAttention requires Ampere or newer)
-    if not _gpu_supports_flash_attention():
-        return _sdpa_attention_fallback(
-            q, k, v,
-            q_lens=q_lens,
-            k_lens=k_lens,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            q_scale=q_scale,
-            causal=causal,
-            dtype=dtype,
-        )
 
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
@@ -196,7 +141,22 @@ def flash_attention(
             window_size=window_size,
             deterministic=deterministic).unflatten(0, (b, lq))
     else:
-        raise ValueError(f"Invalid version: {version}")
+        if q_lens is not None or k_lens is not None:
+            warnings.warn(
+                "Flash attention is unavailable; falling back to scaled_dot_product_attention without padding masks."
+            )
+        q = q.unflatten(0, (b, lq)).transpose(1, 2).to(dtype)
+        k = k.unflatten(0, (b, lk)).transpose(1, 2).to(dtype)
+        v = v.unflatten(0, (b, lk)).transpose(1, 2).to(dtype)
+        x = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            is_causal=causal,
+            dropout_p=dropout_p,
+            scale=softmax_scale,
+        ).transpose(1, 2).contiguous()
 
     # output
     return x.type(out_dtype)
@@ -222,8 +182,14 @@ class AttentionModule(torch.nn.Module):
 
         if os.getenv("ATTENTION_BACKEND") is not None:
             backend = os.getenv("ATTENTION_BACKEND")
-        else:
+        elif FLASH_ATTN_3_AVAILABLE:
+            backend = "FA3"
+        elif FLASH_ATTN_2_AVAILABLE:
             backend = "FA2"
+        elif TRANSFORMER_ENGINE_AVAILABLE:
+            backend = "TE"
+        else:
+            backend = "torch"
 
         # Check for TensorRT at runtime, not import time
         if os.getenv("ENABLE_TENSORRT", "False").lower() == "true":
@@ -231,8 +197,15 @@ class AttentionModule(torch.nn.Module):
 
         # Fall back to FA backend if TE is specified but not available
         if backend == "TE" and not TRANSFORMER_ENGINE_AVAILABLE:
-            print("Warning: Transformer Engine is not available. Falling back to FA2 backend.")
-            backend = "FA2"
+            if FLASH_ATTN_2_AVAILABLE:
+                print("Warning: Transformer Engine is not available. Falling back to FA2 backend.")
+                backend = "FA2"
+            elif FLASH_ATTN_3_AVAILABLE:
+                print("Warning: Transformer Engine is not available. Falling back to FA3 backend.")
+                backend = "FA3"
+            else:
+                print("Warning: Transformer Engine and flash attention are unavailable. Falling back to torch backend.")
+                backend = "torch"
 
         assert backend in ["torch", "FA2", "FA3", "TE", "torch_onnx"]
         self.backend = backend

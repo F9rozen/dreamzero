@@ -7,6 +7,8 @@ Adapted from https://github.com/robo-arena/roboarena/
 import logging
 import time
 from typing import Dict, Tuple
+import inspect
+from urllib.parse import urlparse
 
 import websockets.sync.client
 from typing_extensions import override
@@ -38,27 +40,32 @@ class WebsocketClientPolicy(BasePolicy):
 
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
         logging.info(f"Waiting for server at {self._uri}...")
+        parsed_uri = urlparse(self._uri)
+        is_local_host = parsed_uri.hostname in {"127.0.0.1", "localhost"}
+        connect_signature = inspect.signature(websockets.sync.client.connect)
+        supports_ping_args = (
+            "ping_interval" in connect_signature.parameters
+            and "ping_timeout" in connect_signature.parameters
+        )
+        connect_kwargs = {
+            "compression": None,
+            "max_size": None,
+        }
+        if supports_ping_args:
+            connect_kwargs["ping_interval"] = PING_INTERVAL_SECS
+            connect_kwargs["ping_timeout"] = PING_TIMEOUT_SECS
         try:
-            conn = websockets.sync.client.connect(
-                self._uri, 
-                compression=None, 
-                max_size=None,
-                ping_interval=PING_INTERVAL_SECS,
-                ping_timeout=PING_TIMEOUT_SECS,
-            )
+            conn = websockets.sync.client.connect(self._uri, **connect_kwargs)
             metadata = msgpack_numpy.unpackb(conn.recv())
             return conn, metadata
-        except:
-            logging.info("Connection to server with ws:// failed. Trying wss:// ...")
-            
+        except Exception:
+            logging.exception("Connection to server with ws:// failed")
+            if is_local_host:
+                raise
+
+        logging.info("Trying wss:// ...")
         self._uri = "wss://" + self._uri.split("//")[1]
-        conn = websockets.sync.client.connect(
-            self._uri, 
-            compression=None, 
-            max_size=None,
-            ping_interval=PING_INTERVAL_SECS,
-            ping_timeout=PING_TIMEOUT_SECS,
-        )
+        conn = websockets.sync.client.connect(self._uri, **connect_kwargs)
         metadata = msgpack_numpy.unpackb(conn.recv())
         return conn, metadata
 

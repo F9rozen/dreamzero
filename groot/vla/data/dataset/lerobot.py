@@ -398,9 +398,37 @@ class LeRobotSingleDataset(Dataset):
             return modality_meta
         else:
             modality_meta_path = self.dataset_path / LE_ROBOT_MODALITY_FILENAME
-            assert (
-                modality_meta_path.exists()
-            ), f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
+            if not modality_meta_path.exists():
+                if self.tag == EmbodimentTag.LIBERO_SIM:
+                    return LeRobotModalityMetadata.model_validate(
+                        {
+                            "state": {
+                                "state": {
+                                    "start": 0,
+                                    "end": 8,
+                                    "original_key": "state",
+                                }
+                            },
+                            "action": {
+                                "actions": {
+                                    "start": 0,
+                                    "end": 7,
+                                    "original_key": "actions",
+                                }
+                            },
+                            "video": {
+                                "image": {"original_key": "image"},
+                                "wrist_image": {"original_key": "wrist_image"},
+                            },
+                            "annotation": {
+                                # task_text is a string column added by get_shard() via tasks.jsonl.
+                                "task": {"original_key": "task_text"},
+                            },
+                        }
+                    )
+                raise AssertionError(
+                    f"Please provide a {LE_ROBOT_MODALITY_FILENAME} file in {self.dataset_path}"
+                )
             with open(modality_meta_path, "r") as f:
                 modality_meta = LeRobotModalityMetadata.model_validate(json.load(f))
             return modality_meta
@@ -431,6 +459,11 @@ class LeRobotSingleDataset(Dataset):
                 stats: dict = json.load(f)
             for name in ["num_trajectories", "total_trajectory_length"]:
                 stats.pop(name, None)
+            if self.tag == EmbodimentTag.LIBERO_SIM:
+                for stat in stats.values():
+                    # The exported LIBERO stats only include min/max/mean/std.
+                    stat.setdefault("q01", stat.get("min"))
+                    stat.setdefault("q99", stat.get("max"))
             for name, stat in stats.items():
                 stats[name] = DatasetStatisticalValues.model_validate(stat)
             return stats
@@ -1041,9 +1074,13 @@ class LeRobotSingleDataset(Dataset):
                 channels = le_video_meta["shape"][le_video_meta["names"].index("channel")]
                 fps = le_video_meta["video_info"]["video.fps"]
             except (ValueError, KeyError):
-                # channels = le_video_meta["shape"][le_video_meta["names"].index("channels")]
-                channels = le_video_meta["info"]["video.channels"]
-                fps = le_video_meta["info"]["video.fps"]
+                try:
+                    channels = le_video_meta["info"]["video.channels"]
+                    fps = le_video_meta["info"]["video.fps"]
+                except KeyError:
+                    # Image-backed LeRobot datasets do not carry per-stream video metadata.
+                    channels = le_video_meta["shape"][le_video_meta["names"].index("channel")]
+                    fps = le_info.get("fps", self.fps if self.fps is not None else 1)
             simplified_modality_meta["video"][new_key] = {
                 "resolution": [width, height],
                 "channels": channels,
@@ -1127,9 +1164,25 @@ class LeRobotSingleDataset(Dataset):
             episode_metadata = [json.loads(line) for line in f]
         trajectory_ids = []
         trajectory_lengths = []
+        missing_episodes = 0
+        chunk_size = self._lerobot_info_meta["chunks_size"]
+        data_path_pattern = self._lerobot_info_meta["data_path"]
         for episode in episode_metadata:
-            trajectory_ids.append(episode["episode_index"])
+            trajectory_id = episode["episode_index"]
+            chunk_index = trajectory_id // chunk_size
+            parquet_path = self.dataset_path / data_path_pattern.format(
+                episode_chunk=chunk_index,
+                episode_index=trajectory_id,
+            )
+            if not parquet_path.exists():
+                missing_episodes += 1
+                continue
+            trajectory_ids.append(trajectory_id)
             trajectory_lengths.append(episode["length"])
+        if missing_episodes > 0:
+            print(
+                f"Filtered out {missing_episodes} episodes missing local parquet files under {self.dataset_path}"
+            )
         return np.array(trajectory_ids), np.array(trajectory_lengths)
 
     def _get_all_steps(self) -> list[tuple[int, int]]:
