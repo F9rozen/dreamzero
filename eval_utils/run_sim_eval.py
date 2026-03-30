@@ -38,16 +38,22 @@ from policy_client import WebsocketClientPolicy
 
 
 class DreamZeroJointPosClient(InferenceClient):
-    def __init__(self, 
-                remote_host:str = "localhost", 
+    def __init__(self,
+                remote_host:str = "localhost",
                 remote_port:int = 6000,
                 open_loop_horizon:int = 8,
+                sync_eval:bool = False,
     ) -> None:
         self.client = WebsocketClientPolicy(remote_host, remote_port)
+        self.sync_eval = sync_eval
         self.open_loop_horizon = open_loop_horizon
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk = None
         self.session_id = str(uuid.uuid4())
+        # Per-camera observation buffers for full-chunk sync inference.
+        self.obs_buffer_right: list[np.ndarray] = []
+        self.obs_buffer_left: list[np.ndarray] = []
+        self.obs_buffer_wrist: list[np.ndarray] = []
 
     def visualize(self, request: dict):
         """
@@ -60,40 +66,104 @@ class DreamZeroJointPosClient(InferenceClient):
         combined = np.concatenate([right_img, wrist_img, left_img], axis=1)
         return combined
 
-    def reset(self):
+    def reset(self, gen_video_path: str = "") -> None:
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk = None
         self.session_id = str(uuid.uuid4())
+        self.obs_buffer_right = []
+        self.obs_buffer_left = []
+        self.obs_buffer_wrist = []
+        reset_info: dict = {}
+        if gen_video_path:
+            reset_info["gen_video_path"] = gen_video_path
+        try:
+            self.client.reset(reset_info)
+        except Exception:
+            pass
 
     def infer(self, obs: dict, instruction: str) -> dict:
         """
-        Infer the next action from the policy in a server-client setup
+        Infer the next action from the policy in a server-client setup.
         """
         curr_obs = self._extract_observation(obs)
-        if (
-            self.actions_from_chunk_completed == 0
-            or self.actions_from_chunk_completed >= self.open_loop_horizon
-        ):
-            self.actions_from_chunk_completed = 0
-            request_data = {
-                "observation/exterior_image_0_left": image_tools.resize_with_pad(curr_obs["right_image"], 180, 320),
-                "observation/exterior_image_1_left": image_tools.resize_with_pad(curr_obs["left_image"], 180, 320),
-                "observation/wrist_image_left": image_tools.resize_with_pad(curr_obs["wrist_image"], 180, 320),
-                "observation/joint_position": curr_obs["joint_position"].astype(np.float64),
-                "observation/cartesian_position": np.zeros((6,), dtype=np.float64),  # dummy cartesian position
-                "observation/gripper_position": curr_obs["gripper_position"].astype(np.float64),
-                "prompt": instruction,
-                "session_id": self.session_id,
-            }
-            for k, v in request_data.items():
-                print(f"{k}: {v.shape if not isinstance(v, str) else v}")
-            
-            result = self.client.infer(request_data)
-            actions = result["actions"] if isinstance(result, dict) else result
-            assert len(actions.shape) == 2, f"Expected 2D array, got shape {actions.shape}"
-            assert actions.shape[-1] == 8, f"Expected 8 action dimensions (7 joints + 1 gripper), got {actions.shape[-1]}"
-            self.pred_action_chunk = actions
 
+        if self.sync_eval:
+            # ── Sync mode: execute a full action chunk, then send all collected frames ──
+            # DROID training uses 24 actions at 15fps → 8 video frames at 5fps (stride 3).
+            right_frame = image_tools.resize_with_pad(curr_obs["right_image"], 180, 320)
+            left_frame  = image_tools.resize_with_pad(curr_obs["left_image"],  180, 320)
+            wrist_frame = image_tools.resize_with_pad(curr_obs["wrist_image"], 180, 320)
+
+            if self.actions_from_chunk_completed == 0:
+                # Episode start: single frame triggers server AR reset.
+                request_data = {
+                    "observation/exterior_image_0_left": right_frame,
+                    "observation/exterior_image_1_left": left_frame,
+                    "observation/wrist_image_left": wrist_frame,
+                    "observation/joint_position": curr_obs["joint_position"].astype(np.float64),
+                    "observation/cartesian_position": np.zeros((6,), dtype=np.float64),
+                    "observation/gripper_position": curr_obs["gripper_position"].astype(np.float64),
+                    "prompt": instruction,
+                    "session_id": self.session_id,
+                }
+                self.obs_buffer_right = [right_frame]
+                self.obs_buffer_left  = [left_frame]
+                self.obs_buffer_wrist = [wrist_frame]
+                result = self.client.infer(request_data)
+                actions = result["actions"] if isinstance(result, dict) else result
+                assert actions.ndim == 2 and actions.shape[-1] == 8
+                self.pred_action_chunk = actions
+                self.actions_from_chunk_completed = 0
+            else:
+                self.obs_buffer_right.append(right_frame)
+                self.obs_buffer_left.append(left_frame)
+                self.obs_buffer_wrist.append(wrist_frame)
+
+                if self.actions_from_chunk_completed >= self.open_loop_horizon:
+                    # Full chunk done: downsample to 8 frames with stride 3
+                    # (24 frames at 15fps → 8 frames at 5fps).
+                    right_chunk = np.stack(self.obs_buffer_right[::3][:8])   # (8,H,W,3)
+                    left_chunk  = np.stack(self.obs_buffer_left[::3][:8])    # (8,H,W,3)
+                    wrist_chunk = np.stack(self.obs_buffer_wrist[::3][:8])   # (8,H,W,3)
+                    request_data = {
+                        "observation/exterior_image_0_left": right_chunk,
+                        "observation/exterior_image_1_left": left_chunk,
+                        "observation/wrist_image_left": wrist_chunk,
+                        "observation/joint_position": curr_obs["joint_position"].astype(np.float64),
+                        "observation/cartesian_position": np.zeros((6,), dtype=np.float64),
+                        "observation/gripper_position": curr_obs["gripper_position"].astype(np.float64),
+                        "prompt": instruction,
+                        "session_id": self.session_id,
+                    }
+                    self.obs_buffer_right = [right_frame]
+                    self.obs_buffer_left  = [left_frame]
+                    self.obs_buffer_wrist = [wrist_frame]
+                    result = self.client.infer(request_data)
+                    actions = result["actions"] if isinstance(result, dict) else result
+                    assert actions.ndim == 2 and actions.shape[-1] == 8
+                    self.pred_action_chunk = actions
+                    self.actions_from_chunk_completed = 0
+        else:
+            # ── Original single-frame mode ────────────────────────────────────────────
+            if (
+                self.actions_from_chunk_completed == 0
+                or self.actions_from_chunk_completed >= self.open_loop_horizon
+            ):
+                self.actions_from_chunk_completed = 0
+                request_data = {
+                    "observation/exterior_image_0_left": image_tools.resize_with_pad(curr_obs["right_image"], 180, 320),
+                    "observation/exterior_image_1_left": image_tools.resize_with_pad(curr_obs["left_image"],  180, 320),
+                    "observation/wrist_image_left":      image_tools.resize_with_pad(curr_obs["wrist_image"], 180, 320),
+                    "observation/joint_position": curr_obs["joint_position"].astype(np.float64),
+                    "observation/cartesian_position": np.zeros((6,), dtype=np.float64),
+                    "observation/gripper_position": curr_obs["gripper_position"].astype(np.float64),
+                    "prompt": instruction,
+                    "session_id": self.session_id,
+                }
+                result = self.client.infer(request_data)
+                actions = result["actions"] if isinstance(result, dict) else result
+                assert actions.ndim == 2 and actions.shape[-1] == 8
+                self.pred_action_chunk = actions
 
         action = self.pred_action_chunk[self.actions_from_chunk_completed]
         self.actions_from_chunk_completed += 1
@@ -144,6 +214,11 @@ def main(
         headless: bool = True,
         host: str = "localhost",
         port: int = 6000,
+        max_steps: int = -1,
+        start_episode: int = 0,
+        output_dir: str = "",
+        open_loop_horizon: int = 8,
+        sync_eval: bool = False,
         ):
     # launch omniverse app with arguments (inside function to prevent overriding tyro)
     from isaaclab.app import AppLauncher
@@ -183,17 +258,23 @@ def main(
 
     obs, _ = env.reset()
     obs, _ = env.reset() # need second render cycle to get correctly loaded materials
-    client = DreamZeroJointPosClient(remote_host=host, remote_port=port)
+    client = DreamZeroJointPosClient(
+        remote_host=host,
+        remote_port=port,
+        open_loop_horizon=open_loop_horizon,
+        sync_eval=sync_eval,
+    )
 
 
-    video_dir = Path("runs") / datetime.now().strftime("%Y-%m-%d") / datetime.now().strftime("%H-%M-%S")
+    video_dir = Path(output_dir) if output_dir else Path("runs") / datetime.now().strftime("%Y-%m-%d") / datetime.now().strftime("%H-%M-%S")
     video_dir.mkdir(parents=True, exist_ok=True)
     video = []
-    ep = 0
-    max_steps = env.env.max_episode_length
+    rollout_steps = env.env.max_episode_length
+    if max_steps > 0:
+        rollout_steps = min(rollout_steps, max_steps)
     with torch.no_grad():
-        for ep in range(episodes):
-            for _ in tqdm(range(max_steps), desc=f"Episode {ep+1}/{episodes}"):
+        for ep in range(start_episode, episodes):
+            for _ in tqdm(range(rollout_steps), desc=f"Episode {ep+1}/{episodes}"):
                 ret = client.infer(obs, instruction)
                 if not headless:
                     cv2.imshow("Right Camera", cv2.cvtColor(ret["viz"], cv2.COLOR_RGB2BGR))
@@ -204,13 +285,13 @@ def main(
                 if term or trunc:
                     break
 
-            client.reset()
             mediapy.write_video(
                 video_dir / f"episode_{ep}.mp4",
                 video,
                 fps=15,
             )
             video = []
+            client.reset(gen_video_path=str(video_dir / f"episode_{ep}_gen.mp4"))
 
     env.close()
     simulation_app.close()

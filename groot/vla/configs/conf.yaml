@@ -82,6 +82,7 @@ torch_compile_mode: null
 pretrained_model_path: null
 only_tune_projectors: false
 
+save_deepspeed_checkpoint: true
 save_llm: false
 save_lora_only: false
 save_value_model: false
@@ -113,6 +114,7 @@ training_args:
   warmup_ratio: ${warmup_ratio}
   lr_scheduler_type: ${lr_scheduler_type}
   logging_steps: ${logging_steps}
+  logging_dir: null
   num_train_epochs: ${num_train_epochs}
   max_steps: ${max_steps}
   save_strategy: ${save_strategy}
